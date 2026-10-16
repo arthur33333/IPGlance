@@ -1709,62 +1709,97 @@ function updateProgressBar() {
 async function fetchIPData() {
   showLoadingState();
   hideErrorState();
+  updateHeroStatus('Detecting your IP address…', false);
 
   try {
-    // Primary: ip-api.com gives comprehensive data (IPv4 focus, HTTPS on pro but also works via ipify)
-    // We use two calls:
-    // 1. ipify for IPv4 and IPv6 detection
-    // 2. ip-api via HTTPS for geolocation (note: free tier is HTTP only, so we use ipapi.co for HTTPS)
-    // We'll use ipapi.co which is free, HTTPS, and comprehensive
+    // Detect the public IP independently first. This means the IP can still
+    // be shown even when a geolocation provider is temporarily unavailable.
+    const ipResponse = await fetchWithTimeout('https://api.ipify.org?format=json', 10000);
+    if (!ipResponse.ok) throw new Error('The IP detection service returned HTTP ' + ipResponse.status);
+    const ipPayload = await ipResponse.json();
+    const publicIP = (ipPayload.ip || '').trim();
+    if (!publicIP) throw new Error('The IP detection service returned no IP address.');
 
-    const [geoResult, ipv6Result] = await Promise.allSettled([
-      fetchGeoData(),
-      fetchIPv6()
-    ]);
-
-    if (geoResult.status === 'fulfilled' && geoResult.value) {
-      ipData = geoResult.value;
-      populateDashboard(ipData);
-      initOrUpdateMap(ipData.lat, ipData.lon);
-    } else {
-      throw new Error(geoResult.reason || 'Geolocation fetch failed');
+    let geo = null;
+    try {
+      const geoResponse = await fetchWithTimeout('https://ipapi.co/' + encodeURIComponent(publicIP) + '/json/', 8000);
+      if (geoResponse.ok) {
+        const candidate = await geoResponse.json();
+        if (!candidate.error && candidate.ip) geo = candidate;
+      }
+    } catch (e) {
+      console.warn('Primary geolocation provider unavailable:', e);
     }
 
-    if (ipv6Result.status === 'fulfilled' && ipv6Result.value) {
-      ipv6Data = ipv6Result.value;
+    // Backup provider, if ipapi.co is blocked or rate-limited.
+    if (!geo) {
+      try {
+        const backupResponse = await fetchWithTimeout('https://ipwho.is/' + encodeURIComponent(publicIP), 8000);
+        if (backupResponse.ok) {
+          const b = await backupResponse.json();
+          if (b.success !== false && b.ip) {
+            geo = {
+              ip: b.ip,
+              org: (b.connection && (b.connection.isp || b.connection.org)) || '',
+              city: b.city || '',
+              region: b.region || '',
+              country_name: b.country || '',
+              country_code: b.country_code || '',
+              continent_code: (b.continent_code || ''),
+              timezone: (b.timezone && (b.timezone.id || b.timezone)) || '',
+              latitude: b.latitude,
+              longitude: b.longitude,
+              proxy: b.security ? !!(b.security.proxy || b.security.vpn || b.security.tor) : undefined,
+              mobile: undefined,
+              hosting: b.security ? !!b.security.hosting : undefined,
+              currency: b.currency ? (b.currency.code || '') : ''
+            };
+          }
+        }
+      } catch (e) {
+        console.warn('Backup geolocation provider unavailable:', e);
+      }
+    }
+
+    // Always retain the detected public IP even if location details fail.
+    ipData = Object.assign({ ip: publicIP }, geo || {});
+    ipData.ip = publicIP;
+    populateDashboard(ipData);
+    initOrUpdateMap(ipData.latitude, ipData.longitude);
+
+    try {
+      ipv6Data = await fetchIPv6();
       setIPv6(ipv6Data);
-    } else {
+    } catch (e) {
       setIPv6(null);
     }
 
-    updateHeroStatus('Connected — IP detected', true);
-
+    updateHeroStatus(geo ? 'Connected — IP detected' : 'IP detected — location details unavailable', true);
   } catch (err) {
     console.warn('IP fetch error:', err);
-    showErrorState(err.message || 'Could not retrieve IP information.');
+    showErrorState(err.message || 'Could not detect your public IP. Please check your connection and retry.');
     updateHeroStatus('Detection failed', false);
   }
 }
 
-async function fetchGeoData() {
-  // ipapi.co — free, HTTPS, comprehensive
-  const res = await fetchWithTimeout('https://ipapi.co/json/', 8000);
-  if (!res.ok) throw new Error('API responded with status ' + res.status);
+async function fetchGeoData(ip) {
+  const url = ip
+    ? 'https://ipapi.co/' + encodeURIComponent(ip) + '/json/'
+    : 'https://ipapi.co/json/';
+  const res = await fetchWithTimeout(url, 8000);
+  if (!res.ok) throw new Error('Geolocation API responded with status ' + res.status);
   const data = await res.json();
-  if (data.error) throw new Error(data.reason || 'API error');
+  if (data.error) throw new Error(data.reason || 'Geolocation API error');
   return data;
 }
 
 async function fetchIPv6() {
-  // api64.ipify.org returns IPv6 if available, IPv4 if not
-  // We compare to see if it's actually IPv6
+  // api64 may return IPv4 when the network does not support IPv6.
   const res = await fetchWithTimeout('https://api64.ipify.org?format=json', 6000);
   if (!res.ok) return null;
   const data = await res.json();
-  const ip = data.ip || '';
-  // IPv6 contains colons
-  if (ip.includes(':')) return ip;
-  return null;
+  const ip = (data.ip || '').trim();
+  return ip.includes(':') ? ip : null;
 }
 
 function fetchWithTimeout(url, ms) {
